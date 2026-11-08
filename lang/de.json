@@ -1,0 +1,15 @@
+{
+  "language_name": "Deutsch",
+
+  "tooltip_on": "Startmenü auf dem Monitor mit der Maus\nAn – Klick zum Ausschalten",
+  "tooltip_off": "Startmenü auf dem Monitor mit der Maus\nAus – Klick zum Einschalten",
+
+  "menu_enabled": "Startmenü auf dem Maus-Monitor öffnen",
+  "menu_autostart": "Mit Windows starten",
+  "menu_language": "Sprache (Language)",
+  "menu_language_auto": "Systemstandard ({language})",
+  "menu_exit": "Beenden",
+
+  "autostart_error": "Autostart konnte nicht geändert werden:\n{error}",
+  "hook_error": "Der Tastatur-Hook konnte nicht eingerichtet werden:\n{error}"
+}

@@ -1,0 +1,15 @@
+{
+  "language_name": "English",
+
+  "tooltip_on": "Start menu on the monitor with the mouse\nOn – click to turn off",
+  "tooltip_off": "Start menu on the monitor with the mouse\nOff – click to turn on",
+
+  "menu_enabled": "Open Start on the mouse monitor",
+  "menu_autostart": "Start with Windows",
+  "menu_language": "Language",
+  "menu_language_auto": "System default ({language})",
+  "menu_exit": "Exit",
+
+  "autostart_error": "Could not change the autostart setting:\n{error}",
+  "hook_error": "The keyboard hook could not be installed:\n{error}"
+}
