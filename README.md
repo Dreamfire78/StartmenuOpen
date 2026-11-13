@@ -85,15 +85,20 @@ Settings are stored per user in the registry under `HKEY_CURRENT_USER\Software\S
 Windows offers no API to open Start on a particular monitor, but clicking the Start button of a
 secondary taskbar does exactly that. So the app
 
-1. watches the Windows key with a low-level keyboard hook (`WH_KEYBOARD_LL`),
-2. on its release – if no other key was pressed meanwhile, Start is not already open and the cursor
-   is on a secondary monitor with a visible taskbar – swallows the release and injects an unassigned
-   key (`vkE8`) plus the release instead, so Windows sees a `Win + key` combination and does not open
-   Start on the primary monitor,
-3. clicks the Start button of the taskbar on that monitor (its position comes from the hidden `Start`
-   child window of `Shell_SecondaryTrayWnd`) and moves the cursor straight back.
+1. watches the Windows key with a low-level keyboard hook (`WH_KEYBOARD_LL`) and mouse buttons with a
+   low-level mouse hook (`WH_MOUSE_LL`),
+2. on its release – if no other key or mouse button was pressed meanwhile, Start is not already open
+   and the cursor is on a secondary monitor with a visible taskbar – swallows the release and injects
+   an unassigned key (`vkE8`) plus the release instead, so Windows sees a `Win + key` combination and
+   does not open Start on the primary monitor,
+3. waits 50 ms: if another program reacts to the release with an injected key of its own (AltSnap
+   sends a dummy key after a `Win + drag`; it swallows the drag clicks, so they are invisible to other
+   hooks), it was a combination after all and nothing more happens,
+4. otherwise clicks the Start button of the taskbar on that monitor (its position comes from the hidden
+   `Start` child window of `Shell_SecondaryTrayWnd`) and moves the cursor straight back.
 
-Everything else passes through untouched.
+Everything else passes through untouched. Tools that use the Windows key as a mouse modifier, such as
+[AltSnap](https://github.com/RamonUnch/AltSnap), keep working.
 
 ## Building from source
 

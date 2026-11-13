@@ -9,11 +9,15 @@ Left-click on the tray icon  -> switch the feature on/off
 Right-click                  -> menu (on/off, autostart, language, exit)
 
 How it works: a low-level keyboard hook watches the Windows key. If it is
-released without any other key having been pressed and the cursor is on a
-secondary monitor, the hook masks the key release (an unassigned key, vkE8, is
-injected before it, so Windows sees a "combination" and does not open Start)
-and then clicks the Start button of the taskbar on that monitor. The cursor is
-moved back immediately.
+released without any other key or mouse button having been pressed and the
+cursor is on a secondary monitor, the hook masks the key release (an
+unassigned key, vkE8, is injected before it, so Windows sees a "combination"
+and does not open Start) and then waits a few milliseconds: if another
+program reacts to the release with an injected key of its own (AltSnap does
+after a "Win + drag" - it swallows the drag clicks, so they are invisible
+here), it was a combination after all and nothing happens. Otherwise the app
+clicks the Start button of the taskbar on that monitor. The cursor is moved
+back immediately.
 
 Run with "--open" to open Start once on the monitor under the cursor and exit
 (e.g. for a mouse button mapped to a program).
@@ -32,7 +36,7 @@ import sys
 import winreg
 from ctypes import wintypes
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 APP_NAME = "StartmenuOpen"
 APP_ICON_FILE = "startmenu_open.ico"                 # program icon (exe)
@@ -54,6 +58,7 @@ START_BUTTON_CLASS = "Start"   # hidden child window that tracks the Start butto
 
 MASK_VK = 0xE8                 # unassigned virtual key, used to mask the Win key release
 INJECTED_MARKER = 0x534D4F50   # dwExtraInfo of our own input ("SMOP"), ignored by the hook
+DECIDE_MS = 50                 # grace period after the Win key release (see module docstring)
 CURSOR_RESTORE_MS = 60         # exact cursor restore after the click
 HOOK_REFRESH_MS = 5 * 60 * 1000  # re-install the hook periodically (Windows may drop slow hooks)
 
@@ -72,14 +77,26 @@ WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_TIMER = 0x0113
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
+WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
+WM_MBUTTONDOWN = 0x0207
+WM_MOUSEWHEEL = 0x020A
+WM_XBUTTONDOWN = 0x020B
+WM_MOUSEHWHEEL = 0x020E
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
-WM_OPEN_START = WM_APP + 2
+# Mouse input that turns a held Windows key into a "combination"
+# (Win + click on a taskbar button, Win + wheel, AltSnap's Win + drag, ...).
+MOUSE_ACTION_MESSAGES = (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN,
+                         WM_MOUSEWHEEL, WM_MOUSEHWHEEL)
 
 WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
 HC_ACTION = 0
+LLKHF_INJECTED = 0x10
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -136,8 +153,9 @@ VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 WIN_VKS = (VK_LWIN, VK_RWIN)
 
-TIMER_RESTORE_CURSOR = 1
-TIMER_HOOK_REFRESH = 2
+TIMER_DECIDE = 1
+TIMER_RESTORE_CURSOR = 2
+TIMER_HOOK_REFRESH = 3
 CMD_ENABLED = 1001
 CMD_AUTOSTART = 1002
 CMD_EXIT = 1003
@@ -196,6 +214,16 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
         ("vkCode", wintypes.DWORD),
         ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wintypes.POINT),
+        ("mouseData", wintypes.DWORD),
         ("flags", wintypes.DWORD),
         ("time", wintypes.DWORD),
         ("dwExtraInfo", ULONG_PTR),
@@ -573,10 +601,11 @@ class TrayApp:
         self.tray = tray
         self.hinst = kernel32.GetModuleHandleW(None)
         self.enabled = bool(load_setting("Enabled", 1)) if tray else False
-        self.hook = None
+        self.hook = None          # keyboard hook
+        self.mouse_hook = None
         self.win_vk = None        # Windows key currently held (VK_LWIN/VK_RWIN)
-        self.combo = False        # another key was pressed while it was held
-        self.target = None        # Start button point to click
+        self.combo = False        # another key or a mouse button was pressed while it was held
+        self.pending = None       # Start button point to click once TIMER_DECIDE fires
         self.restore_to = None    # cursor position to restore after the click
         self.menu_languages = []
         self.msg_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
@@ -584,6 +613,7 @@ class TrayApp:
         # Keep references to the callbacks, otherwise they get garbage-collected.
         self.wndproc = WNDPROC(self._wnd_proc)
         self.hookproc = HOOKPROC(self._hook_proc)
+        self.mouse_hookproc = HOOKPROC(self._mouse_hook_proc)
 
         self.hicon = None
         self.app_icon = self.app_icon_small = None
@@ -620,22 +650,33 @@ class TrayApp:
             raise ctypes.WinError(ctypes.get_last_error())
         return name
 
-    # Keyboard hook -------------------------------------------------------------
+    # Keyboard and mouse hooks --------------------------------------------------
     def install_hook(self):
+        """Installs both hooks; returns False (and installs neither) on failure."""
         if not self.hook:
             self.hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.hookproc, self.hinst, 0)
-        return bool(self.hook)
+        if self.hook and not self.mouse_hook:
+            self.mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self.mouse_hookproc, self.hinst, 0)
+        if not (self.hook and self.mouse_hook):
+            error = ctypes.get_last_error()
+            self.uninstall_hook()
+            ctypes.set_last_error(error)
+            return False
+        return True
 
     def uninstall_hook(self):
-        if self.hook:
-            user32.UnhookWindowsHookEx(self.hook)
-            self.hook = None
+        for attr in ("hook", "mouse_hook"):
+            handle = getattr(self, attr)
+            if handle:
+                user32.UnhookWindowsHookEx(handle)
+                setattr(self, attr, None)
         self.win_vk = None
+        self.cancel_pending()
 
     def refresh_hook(self):
         """Windows silently drops a low-level hook that once took too long;
         re-installing it now and then keeps the feature alive."""
-        if self.enabled and self.win_vk is None:
+        if self.enabled and self.win_vk is None and self.pending is None:
             self.uninstall_hook()
             self.install_hook()
 
@@ -643,16 +684,34 @@ class TrayApp:
         try:
             if code == HC_ACTION:
                 kb = KBDLLHOOKSTRUCT.from_address(lparam)
-                if kb.dwExtraInfo != INJECTED_MARKER and self._on_key(kb.vkCode, wparam):
+                if kb.dwExtraInfo != INJECTED_MARKER and self._on_key(kb.vkCode, wparam, kb.flags):
                     return 1  # swallow the key event
         except Exception:  # never let an exception break keyboard input
             pass
         return user32.CallNextHookEx(None, code, wparam, lparam)
 
-    def _on_key(self, vk, wparam):
+    def _mouse_hook_proc(self, code, wparam, lparam):
+        """A mouse button or the wheel while the Windows key is held makes it a
+        combination, so Start must not open afterwards. Nothing is ever
+        swallowed here. (Only hooks installed after AltSnap's see its drag
+        clicks - AltSnap swallows them - hence also the grace period in _on_key.)"""
+        try:
+            if (code == HC_ACTION and self.win_vk is not None and wparam in MOUSE_ACTION_MESSAGES
+                    and MSLLHOOKSTRUCT.from_address(lparam).dwExtraInfo != INJECTED_MARKER):
+                self.combo = True
+        except Exception:  # never let an exception break mouse input
+            pass
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+    def _on_key(self, vk, wparam, flags):
         """Returns True if the event must be swallowed. Runs inside the hook:
-        keep it short, the real work is posted to the window."""
+        keep it short, the real work happens in the window procedure."""
         down = wparam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if self.pending is not None and flags & LLKHF_INJECTED:
+            # Another program reacted to the release with a key of its own
+            # (AltSnap's dummy key after Win + drag) -> it was a combination.
+            # Only injected keys count, so typing right after Win is unaffected.
+            self.cancel_pending()
         if vk in WIN_VKS:
             if down:
                 if self.win_vk is None:
@@ -671,13 +730,27 @@ class TrayApp:
             target = target_for_cursor(include_primary=False)
             if target is None:
                 return False
+            # Release masked right away (other programs see the release and
+            # may react), click only after the grace period. Arm first: the
+            # hook can be re-entered for the reactions while SendInput runs.
+            self.pending = target
+            user32.SetTimer(self.hwnd, TIMER_DECIDE, DECIDE_MS, None)
             release_win_masked(vk)
-            self.target = target
-            user32.PostMessageW(self.hwnd, WM_OPEN_START, 0, 0)
             return True
         if down and self.win_vk is not None:
             self.combo = True
         return False
+
+    def cancel_pending(self):
+        user32.KillTimer(self.hwnd, TIMER_DECIDE)
+        self.pending = None
+
+    def decide(self):
+        """Grace period over without any reaction: open Start on the target monitor."""
+        target, self.pending = self.pending, None
+        user32.KillTimer(self.hwnd, TIMER_DECIDE)
+        if target is not None:
+            self.open_start(target)
 
     # Opening Start -------------------------------------------------------------
     def open_start(self, target):
@@ -799,11 +872,6 @@ class TrayApp:
 
     # Window procedure ----------------------------------------------------------
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_OPEN_START:
-            if self.target:
-                self.open_start(self.target)
-                self.target = None
-            return 0
         if msg == WM_TRAY:
             event = lparam & 0xFFFF
             if event == WM_LBUTTONUP:
@@ -812,7 +880,9 @@ class TrayApp:
                 self.show_menu()
             return 0
         if msg == WM_TIMER:
-            if wparam == TIMER_RESTORE_CURSOR:
+            if wparam == TIMER_DECIDE:
+                self.decide()
+            elif wparam == TIMER_RESTORE_CURSOR:
                 self.restore_cursor()
             elif wparam == TIMER_HOOK_REFRESH:
                 self.refresh_hook()
